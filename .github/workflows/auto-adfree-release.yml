@@ -1,0 +1,133 @@
+name: Auto Ad-Free Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  THEOS: ""
+  VERSION: "0.0.0-0"
+
+jobs:
+  sync-patch-build-release:
+    runs-on: macos-14
+    steps:
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream and apply ad-free patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/Lessica/TrollFools.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('TrollFools/AppListView.swift')
+          s = p.read_text()
+          marker = '    var shouldShowAdvertisement: Bool {'
+          start = s.find(marker)
+          if start == -1:
+              raise SystemExit('shouldShowAdvertisement block not found')
+          end_marker = '\n    var appString:'
+          end = s.find(end_marker, start)
+          if end == -1:
+              raise SystemExit('appString marker after ad block not found')
+          replacement = '    var shouldShowAdvertisement: Bool {\n        false\n    }\n'
+          s = s[:start] + replacement + s[end + 1:]
+          p.write_text(s)
+          PY
+
+          VERSION_FILE="TrollFools/Version.xcconfig"
+          VERSION_MAIN=$(grep "VERSION" "$VERSION_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION_BUILD=$(grep "BUILD_NUMBER" "$VERSION_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION="$VERSION_MAIN-$VERSION_BUILD"
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          SHORT_SHA=${UPSTREAM_SHA:0:7}
+          TAG="adfree-v${VERSION}-${SHORT_SHA}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Computed tag: $TAG"
+
+          git add TrollFools/AppListView.swift .github/workflows/auto-adfree-release.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream and disable ads"
+            git push origin HEAD:main
+          else
+            echo "No source changes to commit."
+          fi
+
+      - name: Install Dependencies
+        run: |
+          echo /usr/local/opt/make/libexec/gnubin >> $GITHUB_PATH
+          echo /opt/homebrew/opt/make/libexec/gnubin >> $GITHUB_PATH
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install dpkg ldid-procursus make xcbeautify openssl@3
+
+      - name: Checkout THEOS
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: 942cd0c015f93d8c2d714ba0c69e7f420157c382
+          path: theos
+          submodules: recursive
+
+      - name: Add THEOS environment variables
+        run: |
+          rm -rf $GITHUB_WORKSPACE/theos/sdks
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+          echo "THEOS_PACKAGE_SCHEME=rootless" >> $GITHUB_ENV
+          echo "FINALPACKAGE=1" >> $GITHUB_ENV
+
+      - name: Checkout SDKs
+        uses: actions/checkout@v4
+        with:
+          repository: theos/sdks
+          ref: master
+          path: ${{ env.THEOS }}/sdks
+
+      - name: Build Packages
+        run: |
+          make package
+          mkdir -p dist
+          cp packages/*.tipa dist/
+          find .theos/obj -name "*.dSYM" -exec cp -r {} dist/ \;
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollFools-${{ env.VERSION }}-adfree
+          path: |
+            dist/*.tipa
+            dist/*.dSYM
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Ad-free build of TrollFools ${VERSION}.\n\nUpstream: Lessica/TrollFools@${UPSTREAM_SHA}\nPatch: disables shouldShowAdvertisement in TrollFools/AppListView.swift."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tipa --clobber
+          else
+            gh release create "$TAG" dist/*.tipa --title "TrollFools ${VERSION} Ad-Free" --notes "$NOTES"
+          fi
