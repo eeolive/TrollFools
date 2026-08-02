@@ -126,8 +126,8 @@ jobs:
         run: |
           set -euo pipefail
           NOTES="Ad-free build of TrollFools ${VERSION}.\n\nUpstream: Lessica/TrollFools@${UPSTREAM_SHA}\nPatch: disables shouldShowAdvertisement in TrollFools/AppListView.swift."
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tipa --clobber
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tipa --clobber --repo "${{ github.repository }}"
           else
-            gh release create "$TAG" dist/*.tipa --title "TrollFools ${VERSION} Ad-Free" --notes "$NOTES"
+            gh release create "$TAG" dist/*.tipa --repo "${{ github.repository }}" --title "TrollFools ${VERSION} Ad-Free" --notes "$NOTES"
           fi
