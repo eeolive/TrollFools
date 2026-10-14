@@ -74,6 +74,13 @@ jobs:
             git push origin HEAD:main
           else
             echo "No source changes to commit."
+            LAST_COMMIT_EPOCH=$(git log -1 --format=%ct)
+            NOW_EPOCH=$(date +%s)
+            AGE_DAYS=$(( (NOW_EPOCH - LAST_COMMIT_EPOCH) / 86400 ))
+            if (( AGE_DAYS >= 45 )); then
+              git commit --allow-empty -m "chore: keep scheduled workflow active"
+              git push origin HEAD:main
+            fi
           fi
 
       - name: Install Dependencies
