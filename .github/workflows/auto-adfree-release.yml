@@ -11,7 +11,6 @@ permissions:
 
 env:
   THEOS: ""
-  VERSION: "0.0.0-0"
 
 jobs:
   sync-patch-build-release:
@@ -28,16 +27,28 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync upstream and apply ad-free patch
+      - name: Sync latest upstream tag and apply ad-free patch
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/Lessica/TrollFools.git
-          git fetch upstream main
-          git merge --no-edit upstream/main
+          git fetch upstream --tags --force
+
+          UPSTREAM_TAG=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)
+          test -n "$UPSTREAM_TAG"
+          UPSTREAM_SHA=$(git rev-list -n 1 "$UPSTREAM_TAG")
+          VERSION=${UPSTREAM_TAG#v}
+          RELEASE_TAG="adfree-${UPSTREAM_TAG}"
+
+          cp .github/workflows/auto-adfree-release.yml "$RUNNER_TEMP/auto-adfree-release.yml"
+          git read-tree --reset -u "$UPSTREAM_TAG"
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/auto-adfree-release.yml" .github/workflows/auto-adfree-release.yml
 
           python3 - <<'PY'
           from pathlib import Path
@@ -52,28 +63,19 @@ jobs:
           if end == -1:
               raise SystemExit('appString marker after ad block not found')
           replacement = '    var shouldShowAdvertisement: Bool {\n        false\n    }\n'
-          s = s[:start] + replacement + s[end + 1:]
-          p.write_text(s)
+          p.write_text(s[:start] + replacement + s[end + 1:])
           PY
 
-          VERSION_FILE="TrollFools/Version.xcconfig"
-          VERSION_MAIN=$(grep "VERSION" "$VERSION_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
-          VERSION_BUILD=$(grep "BUILD_NUMBER" "$VERSION_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
-          VERSION="$VERSION_MAIN-$VERSION_BUILD"
-          UPSTREAM_SHA=$(git rev-parse upstream/main)
-          SHORT_SHA=${UPSTREAM_SHA:0:7}
-          TAG="adfree-v${VERSION}-${SHORT_SHA}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> "$GITHUB_ENV"
           echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "Computed tag: $TAG"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
 
-          git add TrollFools/AppListView.swift .github/workflows/auto-adfree-release.yml
+          git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "chore: sync upstream and disable ads"
+            git commit -m "chore: sync ${UPSTREAM_TAG} and disable ads"
             git push origin HEAD:main
           else
-            echo "No source changes to commit."
             LAST_COMMIT_EPOCH=$(git log -1 --format=%ct)
             NOW_EPOCH=$(date +%s)
             AGE_DAYS=$(( (NOW_EPOCH - LAST_COMMIT_EPOCH) / 86400 ))
@@ -83,13 +85,22 @@ jobs:
             fi
           fi
 
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+            echo "Release $RELEASE_TAG already exists; skipping duplicate build."
+          else
+            echo "SKIP_BUILD=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Install Dependencies
+        if: env.SKIP_BUILD != 'true'
         run: |
           echo /usr/local/opt/make/libexec/gnubin >> $GITHUB_PATH
           echo /opt/homebrew/opt/make/libexec/gnubin >> $GITHUB_PATH
           HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install dpkg ldid-procursus make xcbeautify openssl@3
 
       - name: Checkout THEOS
+        if: env.SKIP_BUILD != 'true'
         uses: actions/checkout@v4
         with:
           repository: theos/theos
@@ -98,6 +109,7 @@ jobs:
           submodules: recursive
 
       - name: Add THEOS environment variables
+        if: env.SKIP_BUILD != 'true'
         run: |
           rm -rf $GITHUB_WORKSPACE/theos/sdks
           echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
@@ -105,6 +117,7 @@ jobs:
           echo "FINALPACKAGE=1" >> $GITHUB_ENV
 
       - name: Checkout SDKs
+        if: env.SKIP_BUILD != 'true'
         uses: actions/checkout@v4
         with:
           repository: theos/sdks
@@ -112,6 +125,7 @@ jobs:
           path: ${{ env.THEOS }}/sdks
 
       - name: Build Packages
+        if: env.SKIP_BUILD != 'true'
         run: |
           make package
           mkdir -p dist
@@ -119,6 +133,7 @@ jobs:
           find .theos/obj -name "*.dSYM" -exec cp -r {} dist/ \;
 
       - name: Upload Artifact
+        if: env.SKIP_BUILD != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: TrollFools-${{ env.VERSION }}-adfree
@@ -127,14 +142,11 @@ jobs:
             dist/*.dSYM
 
       - name: Publish GitHub Release
+        if: env.SKIP_BUILD != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          NOTES="Ad-free build of TrollFools ${VERSION}.\n\nUpstream: Lessica/TrollFools@${UPSTREAM_SHA}\nPatch: disables shouldShowAdvertisement in TrollFools/AppListView.swift."
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tipa --clobber --repo "${{ github.repository }}"
-          else
-            gh release create "$TAG" dist/*.tipa --repo "${{ github.repository }}" --title "TrollFools ${VERSION} Ad-Free" --notes "$NOTES"
-          fi
+          NOTES="Ad-free build of the official upstream ${UPSTREAM_TAG} tag.\n\nUpstream: Lessica/TrollFools@${UPSTREAM_SHA}\nOnly app change: disables shouldShowAdvertisement in TrollFools/AppListView.swift."
+          gh release create "$RELEASE_TAG" dist/*.tipa --repo "${{ github.repository }}" --target main --title "TrollFools ${VERSION} Ad-Free" --notes "$NOTES"
